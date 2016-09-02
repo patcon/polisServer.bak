@@ -25,8 +25,8 @@ Ensure you're running the proper version of Node.js:
 ```
 cat package.json | grep engines -A3
 --  "engines": {
---    "node": "6.2.0",
---    "npm": "3.3.8"
+--    "node": "6.3.1",
+--    "npm": "3.10.3"
 --  },
 nvm install 6.3.1
 nvm use 6.3.1
