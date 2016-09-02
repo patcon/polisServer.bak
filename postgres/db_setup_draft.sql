@@ -41,6 +41,31 @@ CREATE OR REPLACE FUNCTION to_millis(t TIMESTAMP WITH TIME ZONE) RETURNS BIGINT 
         END;
 $$ LANGUAGE plpgsql;
 
+-- http://stackoverflow.com/questions/3970795/how-do-you-create-a-random-string-in-postgresql
+CREATE OR REPLACE FUNCTION random_string(INTEGER)
+RETURNS TEXT AS
+$BODY$
+SELECT array_to_string(
+    ARRAY (
+        SELECT substring(
+            '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+            FROM (ceil(random()*62))::int FOR 1
+        )
+        FROM generate_series(1, $1)
+    ),
+    ''
+)
+$BODY$
+LANGUAGE sql VOLATILE;
+
+CREATE OR REPLACE FUNCTION random_polis_site_id()
+RETURNS TEXT AS
+$BODY$
+-- 18 so it's 32 long, not much thought went into this so far
+SELECT 'polis_site_id_' || random_string(18);
+$BODY$
+LANGUAGE sql VOLATILE;
+
 -- This is a light table that's used exclusively for generating IDs
 CREATE TABLE users(
     -- TODO After testing failure cases with 10, use this:
@@ -167,55 +192,6 @@ CREATE TABLE coupons_for_free_upgrades (
 
 --CREATE TABLE org_member_metadata_types (
 
-CREATE TABLE participant_metadata_questions (
-    pmqid SERIAL,
-    zid INTEGER REFERENCES conversations(zid),
-    key VARCHAR(999), -- City, Office, Role, etc
-    alive BOOLEAN  DEFAULT TRUE, -- !deleted
-    created BIGINT DEFAULT now_as_millis(),
-    UNIQUE (zid, key), -- TODO index!
-    UNIQUE (pmqid)
-);
-
-CREATE TABLE participant_metadata_answers (
-    pmaid SERIAL,
-    pmqid INTEGER REFERENCES participant_metadata_questions(pmqid),
-    zid INTEGER REFERENCES conversations(zid), -- for fast disk-local indexing
-    value VARCHAR(999), -- Seattle, Office 23, Manager, etc
-    alive BOOLEAN DEFAULT TRUE, -- !deleted
-    created BIGINT DEFAULT now_as_millis(),
-    UNIQUE (pmqid, zid, value),
-    UNIQUE (pmaid)
-);
-
-CREATE TABLE participant_metadata_choices (
-    zid INTEGER,
-    pid INTEGER,
-    pmqid INTEGER REFERENCES participant_metadata_questions(pmqid),
-    pmaid INTEGER REFERENCES participant_metadata_answers(pmaid),
-    alive BOOLEAN DEFAULT TRUE, -- !deleted
-    created BIGINT DEFAULT now_as_millis(),
-    FOREIGN KEY (zid, pid) REFERENCES participants (zid, pid),
-    UNIQUE (zid, pid, pmqid, pmaid)
-);
-
- ---- top level
----- these can be used to construct the tree, then add an empty list to each node
---SELECT * FROM participant_metadata_questions WHERE zid = 34;
---SELECT * FROM participant_metadata_answers WHERE zid = 34;
--- now populate the tree with participant entries
---SELECT * from participant_metadata_choices WHERE zid = 34;
-----for (each) {
-----  tree.zid.pmqid.pmaid.push(pid)
-----}
-
-CREATE TABLE contexts(
-    context_id SERIAL,
-    name VARCHAR(300),
-    creator INTEGER REFERENCES users(uid), -- rather than owner, since not sure how ownership will be done
-    is_public BOOLEAN DEFAULT FALSE,
-    created BIGINT DEFAULT now_as_millis(),
-);
 
 CREATE TABLE courses(
     course_id SERIAL,
@@ -224,7 +200,7 @@ CREATE TABLE courses(
     owner INTEGER REFERENCES users(uid),
     course_invite VARCHAR(32),
     created BIGINT DEFAULT now_as_millis(),
-    UNIQUE(invite),
+    UNIQUE(course_invite),
     UNIQUE(course_id)
 );
 CREATE UNIQUE INDEX course_id_idx ON courses USING btree (course_id);
@@ -284,6 +260,79 @@ CREATE TABLE conversations(
 CREATE INDEX conversations_owner_idx ON conversations USING btree (owner);
 
 
+CREATE TABLE participants(
+    pid INTEGER NOT NULL, -- populated by trigger pid_auto
+    uid INTEGER NOT NULL REFERENCES users(uid),
+    zid INTEGER NOT NULL REFERENCES conversations(zid),
+    vote_count INTEGER NOT NULL DEFAULT 0, -- May be greater than number of comments, if they change votes
+    -- What counts as an interaction? voting, commenting, reloading the page (tbd if reloading is a good idea)
+    last_interaction BIGINT NOT NULL DEFAULT 0,
+
+    -- subscription stuff
+    subscribed INTEGER NOT NULL DEFAULT 0, -- 0 for false, 1 for email, 2 for telegram
+    last_notified BIGINT DEFAULT 0, -- time of last email
+
+    mod INTEGER NOT NULL DEFAULT 0,-- {-1,0,1,2} where -1 is "hide from vis", 0 is no action, 1 is "acknowledge", and 2 is is "pin" (always show, even if there are lots of high-follower count alternatives)
+
+    -- server admin bool
+    created BIGINT DEFAULT now_as_millis(),
+    -- archived (not included because creator might not be a participant) will add later somewhere else
+    UNIQUE (zid, pid),
+    UNIQUE (zid, uid)
+);
+CREATE INDEX participants_conv_uid_idx ON participants USING btree (uid); -- speed up the inbox query
+CREATE INDEX participants_conv_idx ON participants USING btree (zid); -- speed up the auto-increment trigger
+
+
+CREATE TABLE participant_metadata_questions (
+    pmqid SERIAL,
+    zid INTEGER REFERENCES conversations(zid),
+    key VARCHAR(999), -- City, Office, Role, etc
+    alive BOOLEAN  DEFAULT TRUE, -- !deleted
+    created BIGINT DEFAULT now_as_millis(),
+    UNIQUE (zid, key), -- TODO index!
+    UNIQUE (pmqid)
+);
+
+CREATE TABLE participant_metadata_answers (
+    pmaid SERIAL,
+    pmqid INTEGER REFERENCES participant_metadata_questions(pmqid),
+    zid INTEGER REFERENCES conversations(zid), -- for fast disk-local indexing
+    value VARCHAR(999), -- Seattle, Office 23, Manager, etc
+    alive BOOLEAN DEFAULT TRUE, -- !deleted
+    created BIGINT DEFAULT now_as_millis(),
+    UNIQUE (pmqid, zid, value),
+    UNIQUE (pmaid)
+);
+
+CREATE TABLE participant_metadata_choices (
+    zid INTEGER,
+    pid INTEGER,
+    pmqid INTEGER REFERENCES participant_metadata_questions(pmqid),
+    pmaid INTEGER REFERENCES participant_metadata_answers(pmaid),
+    alive BOOLEAN DEFAULT TRUE, -- !deleted
+    created BIGINT DEFAULT now_as_millis(),
+    FOREIGN KEY (zid, pid) REFERENCES participants (zid, pid),
+    UNIQUE (zid, pid, pmqid, pmaid)
+);
+
+ ---- top level
+---- these can be used to construct the tree, then add an empty list to each node
+--SELECT * FROM participant_metadata_questions WHERE zid = 34;
+--SELECT * FROM participant_metadata_answers WHERE zid = 34;
+-- now populate the tree with participant entries
+--SELECT * from participant_metadata_choices WHERE zid = 34;
+----for (each) {
+----  tree.zid.pmqid.pmaid.push(pid)
+----}
+
+CREATE TABLE contexts(
+    context_id SERIAL,
+    name VARCHAR(300),
+    creator INTEGER REFERENCES users(uid), -- rather than owner, since not sure how ownership will be done
+    is_public BOOLEAN DEFAULT FALSE,
+    created BIGINT DEFAULT now_as_millis()
+);
 CREATE TABLE slack_oauth_access_tokens (
     slack_access_token VARCHAR(100) NOT NULL,
     slack_scope VARCHAR(100) NOT NULL,
@@ -352,31 +401,6 @@ CREATE TABLE beta(
     created BIGINT DEFAULT now_as_millis(),
     UNIQUE(email)
 );
-
-
-
-CREATE TABLE participants(
-    pid INTEGER NOT NULL, -- populated by trigger pid_auto
-    uid INTEGER NOT NULL REFERENCES users(uid),
-    zid INTEGER NOT NULL REFERENCES conversations(zid),
-    vote_count INTEGER NOT NULL DEFAULT 0, -- May be greater than number of comments, if they change votes
-    -- What counts as an interaction? voting, commenting, reloading the page (tbd if reloading is a good idea)
-    last_interaction BIGINT NOT NULL DEFAULT 0,
-
-    -- subscription stuff
-    subscribed INTEGER NOT NULL DEFAULT 0, -- 0 for false, 1 for email, 2 for telegram
-    last_notified BIGINT DEFAULT 0, -- time of last email
-
-    mod INTEGER NOT NULL DEFAULT 0,-- {-1,0,1,2} where -1 is "hide from vis", 0 is no action, 1 is "acknowledge", and 2 is is "pin" (always show, even if there are lots of high-follower count alternatives)
-
-    -- server admin bool
-    created BIGINT DEFAULT now_as_millis(),
-    -- archived (not included because creator might not be a participant) will add later somewhere else
-    UNIQUE (zid, pid),
-    UNIQUE (zid, uid)
-);
-CREATE INDEX participants_conv_uid_idx ON participants USING btree (uid); -- speed up the inbox query
-CREATE INDEX participants_conv_idx ON participants USING btree (zid); -- speed up the auto-increment trigger
 
 
 CREATE TABLE participants_extended(
@@ -482,7 +506,7 @@ CREATE TABLE facebook_users (
 
 CREATE TABLE social_settings (
     uid INTEGER NOT NULL REFERENCES users(uid),
-    polis_pic VARCHAR(3000), -- profile picture url (should be https)
+    polis_pic VARCHAR(3000) -- profile picture url (should be https)
 );
 
 -- we may have duplicates, since no upsert. We should periodically remove duplicates.
@@ -706,7 +730,7 @@ CREATE TABLE stars(
     pid INTEGER NOT NULL,
     tid INTEGER NOT NULL,
     starred INTEGER NOT NULL, -- 0 for unstarred, 1 for starred
-    created BIGINT DEFAULT now_as_millis(),
+    created BIGINT DEFAULT now_as_millis()
 );
 
 -- not enforcing uniqueness, save complete history
@@ -716,7 +740,7 @@ CREATE TABLE trashes(
     pid INTEGER NOT NULL,
     tid INTEGER NOT NULL,
     trashed INTEGER NOT NULL, -- 1 for trashed, 0 for untrashed
-    created BIGINT DEFAULT now_as_millis(),
+    created BIGINT DEFAULT now_as_millis()
 );
 
 
@@ -727,11 +751,6 @@ CREATE TABLE permanentCookieZidJoins(
     created BIGINT DEFAULT now_as_millis(),
     UNIQUE (zid, cookie)
 );
-
-CREATE TRIGGER pid_auto
-    BEFORE INSERT ON participants
-    FOR EACH ROW -- WHEN (NEW.pid = 0 || NEW.pid = null)
-    EXECUTE PROCEDURE pid_auto();
 
 CREATE OR REPLACE FUNCTION pid_auto()
     RETURNS trigger AS $$
@@ -757,6 +776,13 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql STRICT;
+
+
+CREATE TRIGGER pid_auto
+    BEFORE INSERT ON participants
+    FOR EACH ROW -- WHEN (NEW.pid = 0 || NEW.pid = null)
+    EXECUTE PROCEDURE pid_auto();
+
 
 CREATE OR REPLACE FUNCTION pid_auto_unlock()
     RETURNS trigger AS $$
@@ -853,31 +879,3 @@ CREATE TABLE page_ids (
     zid INTEGER NOT NULL REFERENCES conversations(zid),
     UNIQUE(site_id, page_id)
 );
-
--- http://stackoverflow.com/questions/3970795/how-do-you-create-a-random-string-in-postgresql
-CREATE OR REPLACE FUNCTION random_string(INTEGER)
-RETURNS TEXT AS
-$BODY$
-SELECT array_to_string(
-    ARRAY (
-        SELECT substring(
-            '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
-            FROM (ceil(random()*62))::int FOR 1
-        )
-        FROM generate_series(1, $1)
-    ),
-    ''
-)
-$BODY$
-LANGUAGE sql VOLATILE;
-
-CREATE OR REPLACE FUNCTION random_polis_site_id()
-RETURNS TEXT AS
-$BODY$
--- 18 so it's 32 long, not much thought went into this so far
-SELECT 'polis_site_id_' || random_string(18);
-$BODY$
-LANGUAGE sql VOLATILE;
-
-
-
